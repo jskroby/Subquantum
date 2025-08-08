@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Gate.io Residual Edge Sniper — production async implementation
+- Live WS market data (orderbook+trades)
+- E_min computation and ranking
+- Post-only micro-order execution via ccxt (USDT perpetual)
+"""
+
+import os, ssl, json, time, hmac, math, asyncio, signal, logging, statistics
+from dataclasses import dataclass, field
+from typing import Deque, Dict, List, Optional, Tuple
+from collections import deque, defaultdict
+
+import aiohttp
+import websockets
+import ccxt.async_support as ccxt
+
+# -------------------------- CONFIG --------------------------
+
+GATE_WS_PUBLIC = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+EXCHANGE_ID = "gateio"
+MARKET_TYPE = "swap"          # USDT perpetuals
+SETTLE = "usdt"               # settle coin for futures
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
+API_KEY = os.getenv("GATE_API_KEY", "")
+API_SECRET = os.getenv("GATE_API_SECRET", "")
+
+# Symbols to watch (leave empty to auto-load top N by volume)
+WATCH_SYMBOLS: List[str] = []   # e.g. ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+TOP_N_BY_VOLUME = 50            # if WATCH_SYMBOLS is empty
+
+# Strategy params
+EDGE_SAMPLE_SEC = 3            # rolling trade window for TV_imb
+BOOK_LEVELS = 10               # levels to compute OB_imb
+MICRO_VOLAT_WIN = 40           # ticks for σ_micro (midprice std)
+EMIN_REFRESH_SEC = 1.0         # compute+rank cadence
+
+MAKER_FEE_BPS = float(os.getenv("MAKER_FEE_BPS", "0.02"))  # 0.02 bps? set your actual fee bps
+TAKER_FEE_BPS = float(os.getenv("TAKER_FEE_BPS", "5"))     # e.g. 5 bps
+SLIPPAGE_BPS = 0.5                                          
+SPREAD_SAFETY_BPS = 0.2                                    # require at least this much above costs
+
+TARGET_NOTIONAL_USD = float(os.getenv("TARGET_NOTIONAL_USD", "5.0"))  # micro-notional per order
+MAX_OPEN_ORDERS = int(os.getenv("MAX_OPEN_ORDERS", "30"))
+MAX_EXPOSURE_USD = float(os.getenv("MAX_EXPOSURE_USD", "200"))
+MAX_EXPOSURE_PER_SYMBOL = float(os.getenv("MAX_EXPOSURE_PER_SYMBOL", "50"))
+COOLDOWN_SEC = 3.0
+POST_ONLY = True
+
+# Execution tuner
+MAX_ORDERS_PER_SEC = 5
+SIDE_ROTATION = ["buy", "sell"]  # alternate when edge positive
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+
+# -------------------------- LOGGING --------------------------
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("residual-edge-sniper")
+
+# -------------------------- DATA STRUCTS ---------------------
+
+@dataclass
+class SymbolState:
+    best_bid: float = 0.0
+    best_ask: float = 0.0
+    mid_series: Deque[float] = field(default_factory=lambda: deque(maxlen=MICRO_VOLAT_WIN))
+    book_bids: List[Tuple[float, float]] = field(default_factory=list)  # (price, size)
+    book_asks: List[Tuple[float, float]] = field(default_factory=list)
+    trades_win: Deque[Tuple[float, float, float]] = field(default_factory=deque)  # (ts, price, size>0 buy <0 sell)
+    last_emin: float = 0.0
+    last_vs: float = 0.0
+    last_tv_imb: float = 0.0
+    last_ob_imb: float = 0.0
+    last_sigma_micro: float = 0.0
+    last_ts: float = 0.0
+    cooldown_until: float = 0.0
+
+# -------------------------- HELPERS --------------------------
+
+def now() -> float:
+    return time.time()
+
+def bps_to_frac(x_bps: float) -> float:
+    return x_bps / 1e4
+
+def compute_ob_imb(bids: List[Tuple[float,float]], asks: List[Tuple[float,float]], levels: int) -> float:
+    b = sum(sz for _, sz in bids[:levels])
+    a = sum(sz for _, sz in asks[:levels])
+    tot = (a + b)
+    if tot <= 0: return 0.0
+    return (b - a) / tot
+
+def compute_sigma_micro(mid_series: Deque[float]) -> float:
+    if len(mid_series) < 5: return 0.0
+    diffs = []
+    prev = None
+    for m in mid_series:
+        if prev is not None:
+            diffs.append((m - prev) / prev)
+        prev = m
+    if len(diffs) < 3: return 0.0
+    return statistics.pstdev(diffs) * 1e4  # return in bps (for readability)
+
+def compute_vs(trades_window: Deque[Tuple[float,float,float]]) -> float:
+    # USD notional per second over EDGE_SAMPLE_SEC
+    if not trades_window: return 0.0
+    t0 = trades_window[0][0]
+    t1 = trades_window[-1][0]
+    elapsed = max(1e-3, t1 - t0)
+    usd = sum(abs(sz)*px for _, px, sz in trades_window)
+    return usd / elapsed
+
+def compute_tv_imb(trades_window: Deque[Tuple[float,float,float]]) -> float:
+    if not trades_window: return 0.0
+    buys = sum(sz for _,_,sz in trades_window if sz > 0)
+    sells = sum(-sz for _,_,sz in trades_window if sz < 0)
+    tot = buys + sells
+    if tot <= 0: return 0.0
+    return (buys - sells) / tot
+
+def compute_spread_bps(bb: float, ba: float) -> float:
+    if bb <= 0 or ba <= 0: return 0.0
+    mid = 0.5 * (bb + ba)
+    return (ba - bb) / mid * 1e4
+
+def compute_emin(sigma_micro_bps: float, ob_imb: float, tv_imb: float, vs: float) -> float:
+    # from your spec; returned as percentage (not bps)
+    coh = abs(ob_imb) * abs(tv_imb)
+    if coh <= 0 or sigma_micro_bps <= 0: return 0.0
+    vol_ratio = vs / max(1e-9, (abs(ob_imb) * abs(tv_imb)))
+    frac = vs / (vs + vol_ratio) if (vs + vol_ratio) > 0 else 0.0
+    # sigma_micro_bps is in bps; convert to frac
+    return (sigma_micro_bps / 1e4) * coh * max(0.0, min(1.0, frac))
+
+# -------------------------- WS CLIENT ------------------------
+
+class GateWSClient:
+    def __init__(self, symbols: List[str], on_book, on_trade):
+        self.url = GATE_WS_PUBLIC
+        self.symbols = symbols
+        self.on_book = on_book
+        self.on_trade = on_trade
+        self.ws = None
+        self._stop = False
+
+    @staticmethod
+    def to_gate_contract(symbol_ccxt: str) -> str:
+        # ccxt futures symbol like "BTC/USDT:USDT" -> "BTC_USDT"
+        base = symbol_ccxt.split('/')[0]
+        return f"{base}_USDT"
+
+    def sub_payload(self) -> List[Dict]:
+        payload = []
+        for s in self.symbols:
+            c = self.to_gate_contract(s)
+            payload.append({"time": int(now()), "channel": "futures.order_book", "event": "subscribe",
+                            "payload": [SETTLE, c, BOOK_LEVELS]})
+            payload.append({"time": int(now()), "channel": "futures.trades", "event": "subscribe",
+                            "payload": [SETTLE, c]})
+        return payload
+
+    async def run(self):
+        backoff = 1
+        while not self._stop:
+            try:
+                async with websockets.connect(self.url, ping_interval=20, ping_timeout=20, ssl=ssl.create_default_context()) as ws:
+                    self.ws = ws
+                    # subscribe
+                    for msg in self.sub_payload():
+                        await ws.send(json.dumps(msg))
+                    log.info("Subscribed to %d symbols", len(self.symbols))
+
+                    async for raw in ws:
+                        try:
+                            data = json.loads(raw)
+                            ch = data.get("channel")
+                            if ch == "futures.order_book":
+                                payload = data.get("result") or data.get("event") and data.get("result")
+                                if not payload:
+                                    # sometimes it's an update delta
+                                    payload = data.get("result", data)
+                                if isinstance(payload, dict):
+                                    await self._handle_book(payload)
+                            elif ch == "futures.trades":
+                                payload = data.get("result")
+                                if isinstance(payload, list):
+                                    for tr in payload:
+                                        await self._handle_trade(tr)
+                        except Exception as e:
+                            log.debug("WS parse error: %s", e)
+                    backoff = 1
+            except Exception as e:
+                log.warning("WS disconnected: %s. Reconnecting in %ss", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(30, backoff * 2)
+
+    async def _handle_book(self, ob: Dict):
+        try:
+            # ob sample: { "s": "BTC_USDT", "bids":[["price","size"],...], "asks":[...], "t": 169... }
+            contract = ob.get("s") or ob.get("contract")
+            bids = [(float(p), float(sz)) for p, sz in ob.get("bids", [])]
+            asks = [(float(p), float(sz)) for p, sz in ob.get("asks", [])]
+            ts = float(ob.get("t", now()))
+            await self.on_book(contract, bids, asks, ts)
+        except Exception as e:
+            log.debug("book handle err: %s", e)
+
+    async def _handle_trade(self, tr: Dict):
+        try:
+            # tr sample: {"s":"BTC_USDT","p":"12345","s":"1.2","t":169..,"side":"buy"}
+            contract = tr.get("s") or tr.get("contract")
+            price = float(tr.get("p"))
+            size = float(tr.get("size") or tr.get("amount") or tr.get("s", 0))
+            side = tr.get("side", "buy")
+            ts = float(tr.get("t", now()))
+            signed_size = size if side == "buy" else -size
+            await self.on_trade(contract, price, signed_size, ts)
+        except Exception as e:
+            log.debug("trade handle err: %s", e)
+
+    async def stop(self):
+        self._stop = True
+        try:
+            if self.ws:
+                await self.ws.close()
+        except: pass
+
+# -------------------------- ENGINE ---------------------------
+
+class ResidualEdgeEngine:
+    def __init__(self, exchange: ccxt.Exchange, symbols: List[str]):
+        self.exchange = exchange
+        self.symbols = symbols
+        self.state: Dict[str, SymbolState] = defaultdict(SymbolState)
+        self.contract_to_symbol: Dict[str,str] = {}  # "BTC_USDT" -> "BTC/USDT:USDT"
+        self.open_usd_by_symbol: Dict[str,float] = defaultdict(float)
+        self.open_usd_total: float = 0.0
+        self.last_order_ts = 0.0
+        self.order_rate_bucket = deque(maxlen=MAX_ORDERS_PER_SEC)
+        self._side_ix = 0
+
+    @staticmethod
+    def to_contract(symbol_ccxt: str) -> str:
+        base = symbol_ccxt.split('/')[0]
+        return f"{base}_USDT"
+
+    def register_symbol(self, s: str):
+        self.contract_to_symbol[self.to_contract(s)] = s
+
+    async def on_book(self, contract: str, bids, asks, ts: float):
+        s = self.contract_to_symbol.get(contract)
+        if not s: return
+        st = self.state[s]
+        st.book_bids = bids
+        st.book_asks = asks
+        if bids and asks:
+            st.best_bid = bids[0][0]
+            st.best_ask = asks[0][0]
+            mid = 0.5*(st.best_bid + st.best_ask)
+            if mid > 0:
+                st.mid_series.append(mid)
+        st.last_ts = ts
+
+    async def on_trade(self, contract: str, price: float, signed_size: float, ts: float):
+        s = self.contract_to_symbol.get(contract)
+        if not s: return
+        st = self.state[s]
+        st.trades_win.append((ts, price, signed_size))
+        # prune window to EDGE_SAMPLE_SEC
+        tmin = ts - EDGE_SAMPLE_SEC
+        while st.trades_win and st.trades_win[0][0] < tmin:
+            st.trades_win.popleft()
+        st.last_ts = ts
+
+    async def compute_and_rank(self) -> List[Tuple[str, Dict]]:
+        ranked = []
+        for s in self.symbols:
+            st = self.state[s]
+            if not st.book_bids or not st.book_asks:
+                continue
+            ob_imb = compute_ob_imb(st.book_bids, st.book_asks, BOOK_LEVELS)
+            tv_imb = compute_tv_imb(st.trades_win)
+            vs = compute_vs(st.trades_win)  # USD/sec
+            sigma_bps = compute_sigma_micro(st.mid_series)
+            emin = compute_emin(sigma_bps, ob_imb, tv_imb, vs)  # fraction
+
+            st.last_ob_imb = ob_imb
+            st.last_tv_imb = tv_imb
+            st.last_vs = vs
+            st.last_sigma_micro = sigma_bps
+            st.last_emin = emin
+
+            # effective costs in fraction
+            spread_bps = compute_spread_bps(st.best_bid, st.best_ask)
+            costs_bps = MAKER_FEE_BPS + SLIPPAGE_BPS + SPREAD_SAFETY_BPS
+            edge_ok = (emin * 1e4) > (costs_bps) and spread_bps > (SPREAD_SAFETY_BPS)
+
+            ranked.append((s, {
+                "emin": emin,
+                "sigma_bps": sigma_bps,
+                "ob_imb": ob_imb,
+                "tv_imb": tv_imb,
+                "vs": vs,
+                "spread_bps": spread_bps,
+                "edge_ok": edge_ok,
+            }))
+
+        ranked.sort(key=lambda x: x[1]["emin"], reverse=True)
+        return ranked
+
+    def can_fire(self, symbol: str, notional: float) -> bool:
+        t = now()
+        if t < self.state[symbol].cooldown_until:
+            return False
+        # order rate
+        if len(self.order_rate_bucket) >= MAX_ORDERS_PER_SEC:
+            if (t - self.order_rate_bucket[0]) < 1.0:
+                return False
+            while self.order_rate_bucket and (t - self.order_rate_bucket[0]) >= 1.0:
+                self.order_rate_bucket.popleft()
+        # exposure
+        if self.open_usd_total + notional > MAX_EXPOSURE_USD:
+            return False
+        if self.open_usd_by_symbol[symbol] + notional > MAX_EXPOSURE_PER_SYMBOL:
+            return False
+        return True
+
+    def note_fire(self, symbol: str, notional: float):
+        t = now()
+        self.order_rate_bucket.append(t)
+        self.open_usd_total += notional
+        self.open_usd_by_symbol[symbol] += notional
+        self.state[symbol].cooldown_until = t + COOLDOWN_SEC
+
+    async def place_post_only(self, symbol: str, side: str, notional_usd: float) -> Optional[Dict]:
+        st = self.state[symbol]
+        px = st.best_bid if side == "buy" else st.best_ask
+        if px <= 0: return None
+        amount = max(1e-9, notional_usd / px)
+
+        params = {
+            "type": MARKET_TYPE,
+            "settl": SETTLE,
+            "marginMode": "cross",
+            "reduceOnly": False,
+            # Gate futures supports post_only param in createOrder via ccxt: set "postOnly": True
+            "postOnly": POST_ONLY,
+            "timeInForce": "GTX" if POST_ONLY else "GTC",  # GTX = post-only in ccxt convention
+        }
+
+        try:
+            if DRY_RUN:
+                log.info("[DRY] %s %s %.6f @ %.6f (~$%.2f)", symbol, side.upper(), amount, px, notional_usd)
+                return {"dry": True}
+            order = await self.exchange.create_limit_order(symbol, side, amount, px, params)
+            log.info("ORDER %s %s %.6f @ %.6f id=%s", symbol, side.upper(), amount, px, order.get("id"))
+            return order
+        except Exception as e:
+            log.warning("Order failed %s %s: %s", symbol, side, e)
+            return None
+
+    async def tick(self):
+        ranked = await self.compute_and_rank()
+        if not ranked:
+            return
+
+        # take top few edges that clear costs
+        fired = 0
+        for symbol, m in ranked[:10]:
+            st = self.state[symbol]
+            if not m["edge_ok"]: 
+                continue
+            notional = TARGET_NOTIONAL_USD
+            if not self.can_fire(symbol, notional):
+                continue
+            side = SIDE_ROTATION[self._side_ix % len(SIDE_ROTATION)]
+            self._side_ix += 1
+
+            # place post-only at touch
+            ok = await self.place_post_only(symbol, side, notional)
+            if ok:
+                self.note_fire(symbol, notional)
+                fired += 1
+            if fired >= MAX_ORDERS_PER_SEC:
+                break
+
+        # metrics log (top 3)
+        top3 = ranked[:3]
+        txt = " | ".join([f"{s}:E={m['emin']*1e4:.3f}bps σ={m['sigma_bps']:.2f} OB={m['ob_imb']:.2f} TV={m['tv_imb']:.2f} spr={m['spread_bps']:.2f}" for s,m in top3])
+        if txt:
+            log.info("TOP: %s", txt)
+
+# -------------------------- ORCHESTRATION --------------------
+
+async def load_symbols(exchange: ccxt.Exchange) -> List[str]:
+    await exchange.load_markets()
+    # futures usdt symbols
+    fut = [s for s, m in exchange.markets.items() if m.get("type") == "swap" and m.get("settle") == "USDT" and m.get("active")]
+    if WATCH_SYMBOLS:
+        symbols = [s for s in WATCH_SYMBOLS if s in fut]
+        log.info("Loaded %d specified symbols", len(symbols))
+        return symbols
+    # pick top N by 'info' or 'limits'? Use 'symbol' volume if available, else fallback
+    # ccxt gateio markets includes 'info' with 'mark_price' etc; not guaranteed volume.
+    # We'll just take first TOP_N_BY_VOLUME alphabetically as a sane default then WS computes edge.
+    symbols = sorted(fut)[:TOP_N_BY_VOLUME]
+    log.info("Auto selected %d futures symbols", len(symbols))
+    return symbols
+
+async def main():
+    log.info("Starting Residual Edge Sniper | DRY_RUN=%s", DRY_RUN)
+    exchange = ccxt.gateio({
+        "apiKey": API_KEY,
+        "secret": API_SECRET,
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": MARKET_TYPE,
+            "defaultSettle": SETTLE,
+        }
+    })
+
+    symbols = await load_symbols(exchange)
+    if not symbols:
+        log.error("No symbols loaded. Exiting.")
+        await exchange.close()
+        return
+
+    engine = ResidualEdgeEngine(exchange, symbols)
+    for s in symbols:
+        engine.register_symbol(s)
+
+    # WS callbacks
+    async def on_book(contract, bids, asks, ts):
+        await engine.on_book(contract, bids, asks, ts)
+
+    async def on_trade(contract, price, signed_size, ts):
+        await engine.on_trade(contract, price, signed_size, ts)
+
+    ws = GateWSClient(symbols, on_book, on_trade)
+
+    stop_event = asyncio.Event()
+
+    def handle_sig(*_):
+        log.warning("Shutdown signal received.")
+        stop_event.set()
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, handle_sig)
+        except NotImplementedError:
+            pass  # windows
+
+    # concurrent tasks
+    ws_task = asyncio.create_task(ws.run())
+
+    try:
+        while not stop_event.is_set():
+            await engine.tick()
+            await asyncio.sleep(EMIN_REFRESH_SEC)
+    finally:
+        await ws.stop()
+        ws_task.cancel()
+        try:
+            await ws_task
+        except: pass
+        await exchange.close()
+        log.info("Stopped.")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
